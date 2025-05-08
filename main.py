@@ -1,158 +1,172 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
+from discord.ui import View, Button, Modal, TextInput
 import os
-import asyncio
 from keep_alive import keep_alive
-import pymongo
+from pymongo import MongoClient
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
 
-TOKEN = os.getenv("TOKEN")
-MONGO_URL = os.getenv("MONGO_URL")
+TOKEN = os.getenv("DISCORD_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
+GUILD_ID = int(os.getenv("GUILD_ID"))
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="$", intents=intents)
-bot.remove_command("help")
+tree = bot.tree
+cluster = MongoClient(MONGO_URI)
+db = cluster["karma_ticket"]
+config_col = db["config"]
 
-client = pymongo.MongoClient(MONGO_URL)
-db = client["karma_ticket"]
-config_col = db["configs"]
+class TicketControls(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(Button(label="Claim", style=discord.ButtonStyle.primary, custom_id="claim"))
+        self.add_item(Button(label="Close", style=discord.ButtonStyle.danger, custom_id="close"))
+        self.add_item(Button(label="Close w/ Reason", style=discord.ButtonStyle.secondary, custom_id="close_reason"))
 
-# Sync slash commands
 @bot.event
 async def on_ready():
-    try:
-        synced = await bot.tree.sync()
-        print(f"✅ Synced {len(synced)} command(s)")
-    except Exception as e:
-        print(f"❌ Sync error: {e}")
-    print(f"Bot logged in as {bot.user}")
+    await tree.sync(guild=discord.Object(id=GUILD_ID))
+    print(f"Logged in as {bot.user}")
 
-# /setup command
-@bot.tree.command(name="setup", description="Set up ticket system")
+@tree.command(name="setup", description="Setup the ticket bot", guild=discord.Object(id=GUILD_ID))
 async def setup(interaction: discord.Interaction):
     guild = interaction.guild
     role = await guild.create_role(name="Ticket Staff")
-    await interaction.response.send_message(f"✅ Created role: {role.mention}", ephemeral=True)
+    config_col.update_one({"guild_id": guild.id}, {"$set": {"staff_role": role.id}}, upsert=True)
+    await interaction.response.send_message(f"✅ Setup complete. Created role {role.mention}", ephemeral=True)
 
-# /panel command
-@bot.tree.command(name="panel", description="Build the ticket panel embed")
+class EmbedModal(Modal, title="Create Ticket Panel Embed"):
+    author = TextInput(label="Author", required=False)
+    title_field = TextInput(label="Title")
+    description = TextInput(label="Description")
+    image_url = TextInput(label="Image URL", required=False)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        embed = discord.Embed(title=self.title_field.value, description=self.description.value, color=discord.Color.blue())
+        if self.author.value:
+            embed.set_author(name=self.author.value)
+        if self.image_url.value:
+            embed.set_image(url=self.image_url.value)
+        msg = await interaction.channel.send(embed=embed)
+        config_col.update_one({"guild_id": interaction.guild.id}, {"$set": {"panel_message": msg.id}}, upsert=True)
+        await interaction.response.send_message("✅ Embed created and sent.", ephemeral=True)
+
+@tree.command(name="panel", description="Create a ticket panel", guild=discord.Object(id=GUILD_ID))
 async def panel(interaction: discord.Interaction):
-    def check(m):
-        return m.author == interaction.user and m.channel == interaction.channel
+    await interaction.response.send_modal(EmbedModal())
 
-    await interaction.response.send_message("Author name?", ephemeral=True)
-    author = (await bot.wait_for('message', check=check, timeout=60)).content
-
-    await interaction.followup.send("Title?", ephemeral=True)
-    title = (await bot.wait_for('message', check=check, timeout=60)).content
-
-    await interaction.followup.send("Description?", ephemeral=True)
-    desc = (await bot.wait_for('message', check=check, timeout=60)).content
-
-    await interaction.followup.send("Image URL? (or type 'none')", ephemeral=True)
-    image_url = (await bot.wait_for('message', check=check, timeout=60)).content
-
-    embed = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
-    embed.set_author(name=author)
-    if image_url.lower() != "none":
-        embed.set_image(url=image_url)
-
-    msg = await interaction.channel.send(embed=embed)
-    await interaction.followup.send(f"✅ Embed sent. Message ID: `{msg.id}`", ephemeral=True)
-
-# /button command
-@bot.tree.command(name="button", description="Add a ticket button to a message")
-@app_commands.describe(name="Name of button", category_id="Category where ticket goes", message_id="Message to attach button")
-async def button(interaction: discord.Interaction, name: str, category_id: str, message_id: str):
-    category = discord.utils.get(interaction.guild.categories, id=int(category_id))
+@tree.command(name="button", description="Add a button to the panel", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(name="Button label", category_id="Target category ID")
+async def button(interaction: discord.Interaction, name: str, category_id: str):
+    data = config_col.find_one({"guild_id": interaction.guild.id})
+    msg_id = data.get("panel_message")
+    category = interaction.guild.get_channel(int(category_id))
     if not category:
-        await interaction.response.send_message("❌ Invalid category ID", ephemeral=True)
-        return
+        return await interaction.response.send_message("❌ Invalid category ID.", ephemeral=True)
 
-    view = discord.ui.View()
+    class TicketButton(Button):
+        def __init__(self):
+            super().__init__(label=name, style=discord.ButtonStyle.success, custom_id=f"ticket_{name}")
 
-    async def create_ticket_callback(inter):
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            inter.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-        }
+        async def callback(self, inter: discord.Interaction):
+            staff_role_id = config_col.find_one({"guild_id": interaction.guild.id}).get("staff_role")
+            overwrites = {
+                interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                inter.user: discord.PermissionOverwrite(view_channel=True, send_messages=True)
+            }
+            if staff_role_id:
+                role = interaction.guild.get_role(staff_role_id)
+                overwrites[role] = discord.PermissionOverwrite(view_channel=True)
 
-        staff_role = discord.utils.get(inter.guild.roles, name="Ticket Staff")
-        if staff_role:
-            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True)
+            channel = await category.create_text_channel(f"{name}-{inter.user.name}", overwrites=overwrites)
+            embed = discord.Embed(title="🎫 Ticket Opened", description=f"Hey {inter.user.mention} 👋\nA staff member will assist you shortly.", color=discord.Color.green())
+            await channel.send(embed=embed, view=TicketControls())
+            await inter.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
 
-        channel = await category.create_text_channel(name=f"{name}-{inter.user.name}", overwrites=overwrites)
-        await channel.send(f"🎫 Ticket created by {inter.user.mention}")
+            # Log the ticket creation to webhook if set
+            log_channel = config_col.find_one({"guild_id": interaction.guild.id}).get("log_channel")
+            if log_channel:
+                webhook_url = config_col.find_one({"guild_id": interaction.guild.id}).get("webhook_url")
+                if webhook_url:
+                    log_data = {
+                        "content": f"Ticket created by {inter.user.mention} in category {category.name}.",
+                        "embeds": [{
+                            "title": "New Ticket Opened",
+                            "description": f"Ticket channel: {channel.mention}\nCategory: {category.name}",
+                            "color": 3066993
+                        }]
+                    }
+                    requests.post(webhook_url, json=log_data)
 
-        await inter.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
-
-    button = discord.ui.Button(label=name, style=discord.ButtonStyle.green)
-
-    async def button_callback(interaction: discord.Interaction):
-        await create_ticket_callback(interaction)
-
-    button.callback = button_callback
-    view.add_item(button)
-
+    view = View()
+    view.add_item(TicketButton())
+    channel = interaction.channel
     try:
-        msg = await interaction.channel.fetch_message(int(message_id))
+        msg = await channel.fetch_message(msg_id)
         await msg.edit(view=view)
-        await interaction.response.send_message("✅ Button added", ephemeral=True)
+        await interaction.response.send_message("✅ Button added to panel.", ephemeral=True)
     except:
-        await interaction.response.send_message("❌ Failed to find message", ephemeral=True)
+        await interaction.response.send_message("❌ Failed to find panel message.", ephemeral=True)
 
-# $add command
-@bot.command()
-async def add(ctx, member: discord.Member):
-    if ctx.channel.category and "ticket" in ctx.channel.name:
-        await ctx.channel.set_permissions(member, view_channel=True, send_messages=True)
-        await ctx.send(f"✅ Added {member.mention} to the ticket.")
-    else:
-        await ctx.send("❌ This isn't a ticket channel.")
+@tree.command(name="setlogchannel", description="Set the log channel for ticket actions", guild=discord.Object(id=GUILD_ID))
+async def set_log_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    config_col.update_one({"guild_id": interaction.guild.id}, {"$set": {"log_channel": channel.id}}, upsert=True)
+    await interaction.response.send_message(f"✅ Log channel set to {channel.mention}", ephemeral=True)
 
-# $rename command
-@bot.command()
-async def rename(ctx, *, new_name):
-    await ctx.channel.edit(name=new_name)
-    await ctx.send(f"✅ Renamed channel to `{new_name}`.")
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    if interaction.type == discord.InteractionType.component:
+        cid = interaction.data["custom_id"]
+        if cid == "claim":
+            await interaction.response.send_message(f"✅ Claimed by {interaction.user.mention}.", ephemeral=False)
 
-# $unclaim command
-@bot.command()
-async def unclaim(ctx):
-    await ctx.send("Unclaimed. (You can implement role removal logic here.)")
-
-# Buttons: Claim, Close, Close w/ Reason
-class TicketControls(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-        self.add_item(discord.ui.Button(label="Claim", style=discord.ButtonStyle.primary, custom_id="claim"))
-        self.add_item(discord.ui.Button(label="Close", style=discord.ButtonStyle.danger, custom_id="close"))
-        self.add_item(discord.ui.Button(label="Close with Reason", style=discord.ButtonStyle.secondary, custom_id="close_reason"))
-
-    @discord.ui.button(label="Claim", style=discord.ButtonStyle.primary, custom_id="claim")
-    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(f"{interaction.user.mention} claimed this ticket.", ephemeral=False)
-
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger, custom_id="close")
-    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.channel.delete()
-
-    @discord.ui.button(label="Close with Reason", style=discord.ButtonStyle.secondary, custom_id="close_reason")
-    async def close_reason_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Reason?", ephemeral=True)
-        try:
-            msg = await bot.wait_for("message", timeout=30.0, check=lambda m: m.author == interaction.user)
-            await interaction.channel.send(f"Ticket closed: {msg.content}")
+            # Log claim action
+            log_channel = config_col.find_one({"guild_id": interaction.guild.id}).get("log_channel")
+            if log_channel:
+                webhook_url = config_col.find_one({"guild_id": interaction.guild.id}).get("webhook_url")
+                if webhook_url:
+                    log_data = {
+                        "content": f"Ticket claimed by {interaction.user.mention}.",
+                        "embeds": [{
+                            "title": "Ticket Claimed",
+                            "description": f"Claimed by {interaction.user.mention}",
+                            "color": 3066993
+                        }]
+                    }
+                    requests.post(webhook_url, json=log_data)
+        elif cid == "close":
             await interaction.channel.delete()
-        except asyncio.TimeoutError:
-            await interaction.followup.send("❌ Timed out.", ephemeral=True)
 
-# You can use this view anywhere ticket is created:
-# await channel.send("🎟️ Controls", view=TicketControls())
+            # Log close action
+            log_channel = config_col.find_one({"guild_id": interaction.guild.id}).get("log_channel")
+            if log_channel:
+                webhook_url = config_col.find_one({"guild_id": interaction.guild.id}).get("webhook_url")
+                if webhook_url:
+                    log_data = {
+                        "content": f"Ticket closed by {interaction.user.mention}.",
+                        "embeds": [{
+                            "title": "Ticket Closed",
+                            "description": f"Closed by {interaction.user.mention}",
+                            "color": 15158332
+                        }]
+                    }
+                    requests.post(webhook_url, json=log_data)
+        elif cid == "close_reason":
+            await interaction.response.send_modal(ReasonModal())
+
+    await bot.process_application_commands(interaction)
+
+class ReasonModal(Modal, title="Close with Reason"):
+    reason = TextInput(label="Reason", style=discord.TextStyle.paragraph)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.channel.send(f"Ticket closed by {interaction.user.mention} with reason: {self.reason.value}")
+        await interaction.channel.delete()
 
 keep_alive()
 bot.run(TOKEN)
